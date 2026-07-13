@@ -226,6 +226,7 @@ jobs:
           list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}" "${CLANG_CMAKE_DIR}")
           include(AddLLVM)
           include(AddClang)
+          set(CMAKE_INCLUDE_CURRENT_DIR ON)
           include_directories(SYSTEM ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
           add_definitions(${LLVM_DEFINITIONS})
           foreach(generated_target IN ITEMS
@@ -315,6 +316,7 @@ jobs:
           list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}" "${CLANG_CMAKE_DIR}")
           include(AddLLVM)
           include(AddClang)
+          set(CMAKE_INCLUDE_CURRENT_DIR ON)
           include_directories(SYSTEM ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
           add_definitions(${LLVM_DEFINITIONS})
           foreach(generated_target IN ITEMS
