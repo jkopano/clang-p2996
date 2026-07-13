@@ -1,0 +1,150 @@
+name: Build reflection toolchain
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref from this fork to build
+        required: true
+        default: p2996
+      publish_release:
+        description: Publish or update a GitHub release for the resolved commit
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reflection-toolchain-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout compiler sources
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: Resolve revision
+        id: revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          full="$(git rev-parse HEAD)"
+          short="$(git rev-parse --short=12 HEAD)"
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "tag=toolchain-$short" >> "$GITHUB_OUTPUT"
+
+      - name: Report runner capacity
+        run: |
+          nproc
+          free -h
+          df -h /
+
+      - name: Configure LLVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -G Ninja -S llvm -B build/toolchain \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/clang-p2996" \
+            '-DCMAKE_INSTALL_RPATH=$ORIGIN/../lib' \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_ENABLE_PROJECTS='clang;lld' \
+            -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;libunwind' \
+            -DLLVM_TARGETS_TO_BUILD=X86 \
+            -DLLVM_PARALLEL_LINK_JOBS=2 \
+            -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DLLVM_LINK_LLVM_DYLIB=ON \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_ENABLE_FFI=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DCLANG_DEFAULT_CXX_STDLIB=libc++ \
+            -DCLANG_DEFAULT_LINKER=lld \
+            -DCLANG_INCLUDE_DOCS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF
+
+      - name: Build and install
+        run: cmake --build build/toolchain --target install --parallel "$(nproc)"
+
+      - name: Smoke test reflection and modules
+        shell: bash
+        env:
+          PREFIX: ${{ runner.temp }}/clang-p2996
+        run: |
+          set -euo pipefail
+          export LD_LIBRARY_PATH="$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+          cat > "$RUNNER_TEMP/reflection.cpp" <<'CPP'
+          #include <meta>
+          constexpr auto reflected = ^^int;
+          static_assert(std::meta::is_type(reflected));
+          int main() {}
+          CPP
+
+          cat > "$RUNNER_TEMP/smoke.cppm" <<'CPP'
+          export module smoke;
+          export constexpr int answer() { return 42; }
+          CPP
+
+          "$PREFIX/bin/clang++" -std=c++26 -freflection-latest \
+            "$RUNNER_TEMP/reflection.cpp" -o "$RUNNER_TEMP/reflection"
+          "$RUNNER_TEMP/reflection"
+          "$PREFIX/bin/clang++" -std=c++26 -x c++-module --precompile \
+            "$RUNNER_TEMP/smoke.cppm" -o "$RUNNER_TEMP/smoke.pcm"
+          "$PREFIX/bin/clang++" --version
+
+      - name: Package toolchain
+        id: package
+        shell: bash
+        env:
+          REVISION: ${{ steps.revision.outputs.short }}
+          PREFIX: ${{ runner.temp }}/clang-p2996
+        run: |
+          set -euo pipefail
+          archive="clang-p2996-linux-x86_64-$REVISION.tar.xz"
+          tar -C "$PREFIX" -cJf "$archive" .
+          sha256sum "$archive" > "$archive.sha256"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-p2996-linux-x86_64-${{ steps.revision.outputs.short }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish release
+        if: inputs.publish_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.revision.outputs.tag }}
+          TARGET: ${{ steps.revision.outputs.full }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --target "$TARGET" \
+              --title "Clang/P2996 $TARGET" \
+              --notes "Experimental Linux x86_64 toolchain built from $TARGET. Includes Clang, LLD and the matching libc++ runtimes."
+          fi
+          gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
