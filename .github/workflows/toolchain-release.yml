@@ -7,6 +7,10 @@ on:
         description: Git ref from this fork to build
         required: true
         default: p2996
+      reuse_core_run_id:
+        description: Optional successful run ID whose core SDK artifact should be reused
+        required: false
+        default: ''
       publish_release:
         description: Publish or update a GitHub release for the resolved commit
         required: true
@@ -15,6 +19,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: reflection-toolchain-${{ inputs.ref }}
@@ -57,18 +62,21 @@ jobs:
     timeout-minutes: 360
     steps:
       - name: Checkout exact revision
+        if: inputs.reuse_core_run_id == ''
         uses: actions/checkout@v5
         with:
           ref: ${{ needs.prepare.outputs.full }}
           fetch-depth: 1
 
       - name: Report runner capacity
+        if: inputs.reuse_core_run_id == ''
         run: |
           nproc
           free -h
           df -h /
 
       - name: Configure LLVM, Clang and LLD
+        if: inputs.reuse_core_run_id == ''
         shell: bash
         run: |
           set -euo pipefail
@@ -96,9 +104,11 @@ jobs:
             -DCLANG_INCLUDE_TESTS=OFF
 
       - name: Build and install core SDK
+        if: inputs.reuse_core_run_id == ''
         run: cmake --build build/core --target install --parallel "$(nproc)"
 
       - name: Verify SDK development files
+        if: inputs.reuse_core_run_id == ''
         shell: bash
         run: |
           set -euo pipefail
@@ -109,7 +119,17 @@ jobs:
           "$RUNNER_TEMP/core-sdk/bin/clang++" --version
 
       - name: Pack core SDK
+        if: inputs.reuse_core_run_id == ''
         run: tar -C "$RUNNER_TEMP/core-sdk" --use-compress-program='zstd -T0 -6' -cf "$SDK_ARCHIVE" .
+
+      - name: Reuse core SDK from an earlier run
+        if: inputs.reuse_core_run_id != ''
+        uses: actions/download-artifact@v5
+        with:
+          name: core-sdk-${{ needs.prepare.outputs.short }}
+          path: .
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.reuse_core_run_id }}
 
       - name: Upload core SDK
         uses: actions/upload-artifact@v4
@@ -208,12 +228,15 @@ jobs:
           include(AddClang)
           include_directories(SYSTEM ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
           add_definitions(${LLVM_DEFINITIONS})
-          if(NOT TARGET omp_gen)
-            add_custom_target(omp_gen)
-          endif()
-          if(NOT TARGET ClangDriverOptions)
-            add_custom_target(ClangDriverOptions)
-          endif()
+          foreach(generated_target IN ITEMS
+              omp_gen
+              ClangDriverOptions
+              clang-resource-headers
+              ClangSACheckers)
+            if(NOT TARGET ${generated_target})
+              add_custom_target(${generated_target})
+            endif()
+          endforeach()
           set(CLANG_INCLUDE_TESTS OFF CACHE BOOL "" FORCE)
           set(LLVM_INCLUDE_TESTS OFF CACHE BOOL "" FORCE)
           set(LLVM_INCLUDE_BENCHMARKS OFF CACHE BOOL "" FORCE)
@@ -292,12 +315,15 @@ jobs:
           include(AddClang)
           include_directories(SYSTEM ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
           add_definitions(${LLVM_DEFINITIONS})
-          if(NOT TARGET omp_gen)
-            add_custom_target(omp_gen)
-          endif()
-          if(NOT TARGET ClangDriverOptions)
-            add_custom_target(ClangDriverOptions)
-          endif()
+          foreach(generated_target IN ITEMS
+              omp_gen
+              ClangDriverOptions
+              clang-resource-headers
+              ClangSACheckers)
+            if(NOT TARGET ${generated_target})
+              add_custom_target(${generated_target})
+            endif()
+          endforeach()
           set(CLANG_INCLUDE_TESTS OFF CACHE BOOL "" FORCE)
           set(LLVM_INCLUDE_TESTS OFF CACHE BOOL "" FORCE)
           set(LLVM_INCLUDE_BENCHMARKS OFF CACHE BOOL "" FORCE)
