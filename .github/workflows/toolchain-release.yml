@@ -462,6 +462,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.tag }}
           TARGET: ${{ needs.prepare.outputs.full }}
           ARCHIVE: ${{ steps.package.outputs.archive }}
