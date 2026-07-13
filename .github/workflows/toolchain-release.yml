@@ -266,8 +266,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          binary="$(find build/clangd -type f -name clangd -perm -111 -print -quit)"
+          test -n "$binary"
           mkdir -p "$RUNNER_TEMP/clangd-overlay/bin"
-          cp build/clangd/bin/clangd "$RUNNER_TEMP/clangd-overlay/bin/"
+          cp "$binary" "$RUNNER_TEMP/clangd-overlay/bin/clangd"
           tar -C "$RUNNER_TEMP/clangd-overlay" --use-compress-program='zstd -T0 -6' -cf "$CLANGD_ARCHIVE" .
 
       - name: Upload clangd overlay
@@ -351,8 +353,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          binary="$(find build/clang-tidy -type f -name clang-tidy -perm -111 -print -quit)"
+          test -n "$binary"
           mkdir -p "$RUNNER_TEMP/clang-tidy-overlay/bin"
-          cp build/clang-tidy/bin/clang-tidy "$RUNNER_TEMP/clang-tidy-overlay/bin/"
+          cp "$binary" "$RUNNER_TEMP/clang-tidy-overlay/bin/clang-tidy"
           tar -C "$RUNNER_TEMP/clang-tidy-overlay" --use-compress-program='zstd -T0 -6' -cf "$CLANG_TIDY_ARCHIVE" .
 
       - name: Upload clang-tidy overlay
