@@ -20,11 +20,19 @@ concurrency:
   group: reflection-toolchain-${{ inputs.ref }}
   cancel-in-progress: false
 
-jobs:
-  linux-x86_64:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
+env:
+  SDK_ARCHIVE: clang-p2996-core-sdk.tar.zst
+  RUNTIMES_ARCHIVE: clang-p2996-runtimes.tar.zst
+  CLANGD_ARCHIVE: clang-p2996-clangd.tar.zst
+  CLANG_TIDY_ARCHIVE: clang-p2996-clang-tidy.tar.zst
 
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      full: ${{ steps.revision.outputs.full }}
+      short: ${{ steps.revision.outputs.short }}
+      tag: ${{ steps.revision.outputs.tag }}
     steps:
       - name: Checkout compiler sources
         uses: actions/checkout@v5
@@ -43,23 +51,33 @@ jobs:
           echo "short=$short" >> "$GITHUB_OUTPUT"
           echo "tag=toolchain-$short" >> "$GITHUB_OUTPUT"
 
+  core-sdk:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.full }}
+          fetch-depth: 1
+
       - name: Report runner capacity
         run: |
           nproc
           free -h
           df -h /
 
-      - name: Configure LLVM
+      - name: Configure LLVM, Clang and LLD
         shell: bash
         run: |
           set -euo pipefail
-          cmake -G Ninja -S llvm -B build/toolchain \
+          cmake -G Ninja -S llvm -B build/core \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/clang-p2996" \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/core-sdk" \
             '-DCMAKE_INSTALL_RPATH=$ORIGIN/../lib' \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DLLVM_ENABLE_PROJECTS='clang;lld' \
-            -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;libunwind' \
             -DLLVM_TARGETS_TO_BUILD=X86 \
             -DLLVM_PARALLEL_LINK_JOBS=2 \
             -DLLVM_BUILD_LLVM_DYLIB=ON \
@@ -73,15 +91,274 @@ jobs:
             -DLLVM_ENABLE_TERMINFO=OFF \
             -DLLVM_ENABLE_ZLIB=OFF \
             -DLLVM_ENABLE_ZSTD=OFF \
-            -DCLANG_DEFAULT_CXX_STDLIB=libc++ \
             -DCLANG_DEFAULT_LINKER=lld \
             -DCLANG_INCLUDE_DOCS=OFF \
             -DCLANG_INCLUDE_TESTS=OFF
 
-      - name: Build and install
-        run: cmake --build build/toolchain --target install --parallel "$(nproc)"
+      - name: Build and install core SDK
+        run: cmake --build build/core --target install --parallel "$(nproc)"
 
-      - name: Smoke test reflection and modules
+      - name: Verify SDK development files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "$RUNNER_TEMP/core-sdk/bin/clang++"
+          test -x "$RUNNER_TEMP/core-sdk/bin/ld.lld"
+          test -f "$RUNNER_TEMP/core-sdk/lib/cmake/llvm/LLVMConfig.cmake"
+          test -f "$RUNNER_TEMP/core-sdk/lib/cmake/clang/ClangConfig.cmake"
+          "$RUNNER_TEMP/core-sdk/bin/clang++" --version
+
+      - name: Pack core SDK
+        run: tar -C "$RUNNER_TEMP/core-sdk" --use-compress-program='zstd -T0 -6' -cf "$SDK_ARCHIVE" .
+
+      - name: Upload core SDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-sdk-${{ needs.prepare.outputs.short }}
+          path: ${{ env.SDK_ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 3
+
+  runtimes:
+    needs: [prepare, core-sdk]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.full }}
+          fetch-depth: 1
+
+      - name: Download core SDK
+        uses: actions/download-artifact@v5
+        with:
+          name: core-sdk-${{ needs.prepare.outputs.short }}
+          path: artifacts
+
+      - name: Extract core SDK
+        run: |
+          mkdir -p "$RUNNER_TEMP/core-sdk"
+          tar -C "$RUNNER_TEMP/core-sdk" --use-compress-program=unzstd -xf "artifacts/$SDK_ARCHIVE"
+
+      - name: Configure matching libc++ runtimes
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="$RUNNER_TEMP/core-sdk"
+          cmake -G Ninja -S runtimes -B build/runtimes \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$sdk/bin/clang" \
+            -DCMAKE_CXX_COMPILER="$sdk/bin/clang++" \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/runtime-overlay" \
+            -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;libunwind' \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLIBCXX_INCLUDE_TESTS=OFF \
+            -DLIBCXXABI_INCLUDE_TESTS=OFF \
+            -DLIBUNWIND_INCLUDE_TESTS=OFF
+
+      - name: Build and install runtimes
+        run: cmake --build build/runtimes --target install-cxx install-cxxabi install-unwind --parallel "$(nproc)"
+
+      - name: Pack runtime overlay
+        run: tar -C "$RUNNER_TEMP/runtime-overlay" --use-compress-program='zstd -T0 -6' -cf "$RUNTIMES_ARCHIVE" .
+
+      - name: Upload runtime overlay
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtimes-${{ needs.prepare.outputs.short }}
+          path: ${{ env.RUNTIMES_ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 3
+
+  clangd:
+    needs: [prepare, core-sdk]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.full }}
+          fetch-depth: 1
+
+      - name: Download core SDK
+        uses: actions/download-artifact@v5
+        with:
+          name: core-sdk-${{ needs.prepare.outputs.short }}
+          path: artifacts
+
+      - name: Extract core SDK
+        run: |
+          mkdir -p "$RUNNER_TEMP/core-sdk"
+          tar -C "$RUNNER_TEMP/core-sdk" --use-compress-program=unzstd -xf "artifacts/$SDK_ARCHIVE"
+
+      - name: Create standalone clang-tools-extra project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir standalone-tools
+          cat > standalone-tools/CMakeLists.txt <<'CMAKE'
+          cmake_minimum_required(VERSION 3.20)
+          project(StandaloneClangToolsExtra LANGUAGES C CXX)
+          find_package(LLVM REQUIRED CONFIG)
+          find_package(Clang REQUIRED CONFIG)
+          list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}" "${CLANG_CMAKE_DIR}")
+          include(AddLLVM)
+          include(AddClang)
+          include_directories(SYSTEM ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
+          add_definitions(${LLVM_DEFINITIONS})
+          if(NOT TARGET omp_gen)
+            add_custom_target(omp_gen)
+          endif()
+          if(NOT TARGET ClangDriverOptions)
+            add_custom_target(ClangDriverOptions)
+          endif()
+          set(CLANG_INCLUDE_TESTS OFF CACHE BOOL "" FORCE)
+          set(LLVM_INCLUDE_TESTS OFF CACHE BOOL "" FORCE)
+          set(LLVM_INCLUDE_BENCHMARKS OFF CACHE BOOL "" FORCE)
+          add_subdirectory("${CLANG_TOOLS_EXTRA_SOURCE_DIR}" clang-tools-extra EXCLUDE_FROM_ALL)
+          CMAKE
+
+      - name: Configure clangd against the SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="$RUNNER_TEMP/core-sdk"
+          cmake -G Ninja -S standalone-tools -B build/clangd \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$sdk/bin/clang" \
+            -DCMAKE_CXX_COMPILER="$sdk/bin/clang++" \
+            -DLLVM_DIR="$sdk/lib/cmake/llvm" \
+            -DClang_DIR="$sdk/lib/cmake/clang" \
+            -DCLANG_TOOLS_EXTRA_SOURCE_DIR="$GITHUB_WORKSPACE/clang-tools-extra" \
+            -DCLANGD_TIDY_CHECKS=OFF \
+            -DCLANGD_BUILD_DEXP=OFF \
+            -DCLANGD_DECISION_FOREST=OFF
+
+      - name: Build clangd
+        run: cmake --build build/clangd --target clangd --parallel "$(nproc)"
+
+      - name: Pack clangd overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/clangd-overlay/bin"
+          cp build/clangd/bin/clangd "$RUNNER_TEMP/clangd-overlay/bin/"
+          tar -C "$RUNNER_TEMP/clangd-overlay" --use-compress-program='zstd -T0 -6' -cf "$CLANGD_ARCHIVE" .
+
+      - name: Upload clangd overlay
+        uses: actions/upload-artifact@v4
+        with:
+          name: clangd-${{ needs.prepare.outputs.short }}
+          path: ${{ env.CLANGD_ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 3
+
+  clang-tidy:
+    needs: [prepare, core-sdk]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.full }}
+          fetch-depth: 1
+
+      - name: Download core SDK
+        uses: actions/download-artifact@v5
+        with:
+          name: core-sdk-${{ needs.prepare.outputs.short }}
+          path: artifacts
+
+      - name: Extract core SDK
+        run: |
+          mkdir -p "$RUNNER_TEMP/core-sdk"
+          tar -C "$RUNNER_TEMP/core-sdk" --use-compress-program=unzstd -xf "artifacts/$SDK_ARCHIVE"
+
+      - name: Create standalone clang-tools-extra project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir standalone-tools
+          cat > standalone-tools/CMakeLists.txt <<'CMAKE'
+          cmake_minimum_required(VERSION 3.20)
+          project(StandaloneClangToolsExtra LANGUAGES C CXX)
+          find_package(LLVM REQUIRED CONFIG)
+          find_package(Clang REQUIRED CONFIG)
+          list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}" "${CLANG_CMAKE_DIR}")
+          include(AddLLVM)
+          include(AddClang)
+          include_directories(SYSTEM ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
+          add_definitions(${LLVM_DEFINITIONS})
+          if(NOT TARGET omp_gen)
+            add_custom_target(omp_gen)
+          endif()
+          if(NOT TARGET ClangDriverOptions)
+            add_custom_target(ClangDriverOptions)
+          endif()
+          set(CLANG_INCLUDE_TESTS OFF CACHE BOOL "" FORCE)
+          set(LLVM_INCLUDE_TESTS OFF CACHE BOOL "" FORCE)
+          set(LLVM_INCLUDE_BENCHMARKS OFF CACHE BOOL "" FORCE)
+          add_subdirectory("${CLANG_TOOLS_EXTRA_SOURCE_DIR}" clang-tools-extra EXCLUDE_FROM_ALL)
+          CMAKE
+
+      - name: Configure clang-tidy against the SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="$RUNNER_TEMP/core-sdk"
+          cmake -G Ninja -S standalone-tools -B build/clang-tidy \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$sdk/bin/clang" \
+            -DCMAKE_CXX_COMPILER="$sdk/bin/clang++" \
+            -DLLVM_DIR="$sdk/lib/cmake/llvm" \
+            -DClang_DIR="$sdk/lib/cmake/clang" \
+            -DCLANG_TOOLS_EXTRA_SOURCE_DIR="$GITHUB_WORKSPACE/clang-tools-extra" \
+            -DCLANG_ENABLE_CLANGD=OFF
+
+      - name: Build clang-tidy
+        run: cmake --build build/clang-tidy --target clang-tidy --parallel "$(nproc)"
+
+      - name: Pack clang-tidy overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/clang-tidy-overlay/bin"
+          cp build/clang-tidy/bin/clang-tidy "$RUNNER_TEMP/clang-tidy-overlay/bin/"
+          tar -C "$RUNNER_TEMP/clang-tidy-overlay" --use-compress-program='zstd -T0 -6' -cf "$CLANG_TIDY_ARCHIVE" .
+
+      - name: Upload clang-tidy overlay
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-tidy-${{ needs.prepare.outputs.short }}
+          path: ${{ env.CLANG_TIDY_ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 3
+
+  package-release:
+    needs: [prepare, core-sdk, runtimes, clangd, clang-tidy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Download toolchain layers
+        uses: actions/download-artifact@v5
+        with:
+          pattern: '*-${{ needs.prepare.outputs.short }}'
+          path: artifacts
+          merge-multiple: true
+
+      - name: Assemble toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/clang-p2996"
+          for archive in "$SDK_ARCHIVE" "$RUNTIMES_ARCHIVE" "$CLANGD_ARCHIVE" "$CLANG_TIDY_ARCHIVE"; do
+            tar -C "$RUNNER_TEMP/clang-p2996" --use-compress-program=unzstd -xf "artifacts/$archive"
+          done
+
+      - name: Smoke test reflection, modules and tools
         shell: bash
         env:
           PREFIX: ${{ runner.temp }}/clang-p2996
@@ -101,30 +378,31 @@ jobs:
           export constexpr int answer() { return 42; }
           CPP
 
-          "$PREFIX/bin/clang++" -std=c++26 -freflection-latest \
+          "$PREFIX/bin/clang++" -std=c++26 -stdlib=libc++ -freflection-latest \
             "$RUNNER_TEMP/reflection.cpp" -o "$RUNNER_TEMP/reflection"
           "$RUNNER_TEMP/reflection"
           "$PREFIX/bin/clang++" -std=c++26 -x c++-module --precompile \
             "$RUNNER_TEMP/smoke.cppm" -o "$RUNNER_TEMP/smoke.pcm"
-          "$PREFIX/bin/clang++" --version
+          "$PREFIX/bin/clangd" --version
+          "$PREFIX/bin/clang-tidy" --version
 
       - name: Package toolchain
         id: package
         shell: bash
         env:
-          REVISION: ${{ steps.revision.outputs.short }}
+          REVISION: ${{ needs.prepare.outputs.short }}
           PREFIX: ${{ runner.temp }}/clang-p2996
         run: |
           set -euo pipefail
-          archive="clang-p2996-linux-x86_64-$REVISION.tar.xz"
-          tar -C "$PREFIX" -cJf "$archive" .
+          archive="clang-p2996-linux-x86_64-$REVISION.tar.zst"
+          tar -C "$PREFIX" --use-compress-program='zstd -T0 -12' -cf "$archive" .
           sha256sum "$archive" > "$archive.sha256"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
-      - name: Upload workflow artifact
+      - name: Upload complete toolchain
         uses: actions/upload-artifact@v4
         with:
-          name: clang-p2996-linux-x86_64-${{ steps.revision.outputs.short }}
+          name: clang-p2996-linux-x86_64-${{ needs.prepare.outputs.short }}
           path: |
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.archive }}.sha256
@@ -136,8 +414,8 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.revision.outputs.tag }}
-          TARGET: ${{ steps.revision.outputs.full }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET: ${{ needs.prepare.outputs.full }}
           ARCHIVE: ${{ steps.package.outputs.archive }}
         run: |
           set -euo pipefail
@@ -145,6 +423,6 @@ jobs:
             gh release create "$TAG" \
               --target "$TARGET" \
               --title "Clang/P2996 $TARGET" \
-              --notes "Experimental Linux x86_64 toolchain built from $TARGET. Includes Clang, LLD and the matching libc++ runtimes."
+              --notes "Experimental Linux x86_64 toolchain built from $TARGET. Includes Clang, LLD, libc++, clangd and clang-tidy."
           fi
           gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
