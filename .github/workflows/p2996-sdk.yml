@@ -1,0 +1,195 @@
+name: Build P2996 toolchain and module SDKs
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Optional GitHub release tag. Leave empty to publish workflow artifacts only.
+        required: false
+        type: string
+  push:
+    branches: [p2996]
+    paths:
+      - ".github/workflows/p2996-sdk.yml"
+      - "clang/**"
+      - "llvm/**"
+      - "lld/**"
+      - "clang-tools-extra/**"
+      - "libcxx/**"
+      - "libcxxabi/**"
+      - "libunwind/**"
+
+permissions:
+  contents: read
+
+env:
+  LLVM_MINGW_VERSION: "20260407"
+  LLVM_MINGW_ARCHIVE: llvm-mingw-20260407-ucrt-ubuntu-22.04-x86_64.tar.xz
+  TARGET_TRIPLE: x86_64-w64-windows-gnu
+
+jobs:
+  toolchain:
+    name: Host compiler and tools
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build ccache zstd
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: p2996-ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: p2996-ccache-${{ runner.os }}-
+      - name: Configure
+        run: >-
+          cmake -G Ninja -S llvm -B build/toolchain
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/stage/toolchain"
+          -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra;lld"
+          -DLLVM_TARGETS_TO_BUILD=X86
+          -DLLVM_ENABLE_ASSERTIONS=OFF
+          -DLLVM_INCLUDE_TESTS=OFF
+          -DLLVM_INCLUDE_BENCHMARKS=OFF
+          -DLLVM_INCLUDE_EXAMPLES=OFF
+          -DLLVM_ENABLE_TERMINFO=OFF
+          -DLLVM_ENABLE_ZLIB=FORCE_ON
+          -DLLVM_ENABLE_ZSTD=FORCE_ON
+          -DLLVM_ENABLE_LTO=Thin
+          -DLLVM_CCACHE_BUILD=ON
+      - name: Build and install
+        run: cmake --build build/toolchain --target install --parallel "$(nproc)"
+      - name: Pack stage one
+        run: tar --use-compress-program='zstd -T0 -19' -cf toolchain.tar.zst -C stage toolchain
+      - uses: actions/upload-artifact@v4
+        with:
+          name: p2996-toolchain-${{ github.sha }}
+          path: toolchain.tar.zst
+          retention-days: 7
+
+  linux-sdk:
+    name: Linux libc++ SDK and BMIs
+    needs: toolchain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: p2996-toolchain-${{ github.sha }}
+      - run: mkdir -p stage && tar --use-compress-program=unzstd -xf toolchain.tar.zst -C stage
+      - name: Configure libc++ runtimes
+        run: >-
+          cmake -G Ninja -S runtimes -B build/linux-sdk
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/stage/linux-x64"
+          -DCMAKE_C_COMPILER="$GITHUB_WORKSPACE/stage/toolchain/bin/clang"
+          -DCMAKE_CXX_COMPILER="$GITHUB_WORKSPACE/stage/toolchain/bin/clang++"
+          -DLLVM_PATH="$GITHUB_WORKSPACE/llvm"
+          -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind"
+          -DLLVM_INCLUDE_TESTS=OFF
+          -DLIBCXX_INCLUDE_TESTS=OFF
+          -DLIBCXXABI_INCLUDE_TESTS=OFF
+          -DLIBUNWIND_INCLUDE_TESTS=OFF
+          -DLIBCXX_INSTALL_MODULES=ON
+      - name: Build and install libc++ runtimes
+        run: cmake --build build/linux-sdk --target install --parallel "$(nproc)"
+      - name: Precompile standard-library modules
+        run: |
+          modules="$GITHUB_WORKSPACE/stage/linux-x64/share/libc++/v1"
+          cxx="$GITHUB_WORKSPACE/stage/toolchain/bin/clang++"
+          common=( -std=c++26 -nostdinc++ -isystem "$GITHUB_WORKSPACE/stage/linux-x64/include/c++/v1" -Wno-reserved-module-identifier -Wno-reserved-user-defined-literal )
+          "$cxx" "${common[@]}" --precompile -c "$modules/std.cppm" -o "$modules/std.pcm"
+          "$cxx" "${common[@]}" -fmodule-file=std="$modules/std.pcm" --precompile -c "$modules/std.compat.cppm" -o "$modules/std.compat.pcm"
+          printf 'import std; int main() { std::vector<int> v; return v.size(); }\n' > smoke.cpp
+          "$cxx" "${common[@]}" -fmodule-file=std="$modules/std.pcm" -c smoke.cpp -o smoke.o
+      - name: Pack Linux SDK
+        run: tar --use-compress-program='zstd -T0 -19' -cf linux-x64-sdk.tar.zst -C stage linux-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: p2996-linux-sdk-${{ github.sha }}
+          path: linux-x64-sdk.tar.zst
+          retention-days: 7
+
+  windows-sdk:
+    name: Windows x64 libc++ module SDK
+    needs: toolchain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: p2996-toolchain-${{ github.sha }}
+      - run: mkdir -p stage && tar --use-compress-program=unzstd -xf toolchain.tar.zst -C stage
+      - name: Download llvm-mingw sysroot
+        run: |
+          curl -L --retry 3 -o llvm-mingw.tar.xz "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${LLVM_MINGW_ARCHIVE}"
+          mkdir -p stage/windows-x64/sysroot
+          tar -xJf llvm-mingw.tar.xz --strip-components=1 -C stage/windows-x64/sysroot
+      - name: Generate libc++ module sources
+        run: >-
+          cmake -G Ninja -S libcxx -B build/windows-module-sources
+          -DLLVM_PATH="$GITHUB_WORKSPACE/llvm"
+          -DLLVM_BINARY_DIR="$GITHUB_WORKSPACE/build/windows-module-sources"
+          -DLIBCXX_ENABLE_SHARED=OFF
+          -DLIBCXX_ENABLE_STATIC=OFF
+          -DLIBCXX_INCLUDE_TESTS=OFF
+          -DLIBCXX_INSTALL_MODULES=ON
+          -DCMAKE_CXX_COMPILER="$GITHUB_WORKSPACE/stage/toolchain/bin/clang++"
+      - run: cmake --build build/windows-module-sources --target generate-cxx-modules --parallel "$(nproc)"
+      - name: Precompile Windows standard-library modules
+        run: |
+          root="$GITHUB_WORKSPACE/stage/windows-x64"
+          sysroot="$root/sysroot"
+          modules="$root/modules"
+          mkdir -p "$modules"
+          cp -a build/windows-module-sources/modules/c++/v1/. "$modules/"
+          cxx="$GITHUB_WORKSPACE/stage/toolchain/bin/clang++"
+          common=( --target="$TARGET_TRIPLE" --sysroot="$sysroot" -resource-dir="$GITHUB_WORKSPACE/stage/toolchain/lib/clang/21" -std=c++26 -stdlib=libc++ -nostdinc++ -isystem "$sysroot/include/c++/v1" -Wno-reserved-module-identifier -Wno-reserved-user-defined-literal )
+          "$cxx" "${common[@]}" --precompile -c "$modules/std.cppm" -o "$modules/std.pcm"
+          "$cxx" "${common[@]}" -fmodule-file=std="$modules/std.pcm" --precompile -c "$modules/std.compat.cppm" -o "$modules/std.compat.pcm"
+          printf 'import std; int main() { std::vector<int> v; return v.size(); }\n' > smoke.cpp
+          "$cxx" "${common[@]}" -fmodule-file=std="$modules/std.pcm" -c smoke.cpp -o smoke.obj
+      - name: Write SDK manifest
+        run: |
+          printf '%s\n' "clang-revision=${GITHUB_SHA}" "llvm-mingw-version=${LLVM_MINGW_VERSION}" "target=${TARGET_TRIPLE}" > stage/windows-x64/manifest.txt
+      - name: Pack Windows SDK
+        run: |
+          rm -rf stage/windows-x64/sysroot
+          tar --use-compress-program='zstd -T0 -19' -cf windows-x64-sdk.tar.zst -C stage windows-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: p2996-windows-x64-sdk-${{ github.sha }}
+          path: windows-x64-sdk.tar.zst
+          retention-days: 7
+
+  release:
+    name: Publish combined toolchain release
+    if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+    needs: [toolchain, linux-sdk, windows-sdk]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: p2996-*
+          merge-multiple: true
+      - name: Rename release assets
+        run: |
+          mv toolchain.tar.zst "clang-p2996-linux-x86_64-${GITHUB_SHA}.tar.zst"
+          mv linux-x64-sdk.tar.zst "clang-p2996-linux-sdk-x86_64-${GITHUB_SHA}.tar.zst"
+          mv windows-x64-sdk.tar.zst "clang-p2996-windows-sdk-x86_64-${GITHUB_SHA}.tar.zst"
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          generate_release_notes: true
+          files: clang-p2996-*.tar.zst
