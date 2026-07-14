@@ -156,7 +156,7 @@ jobs:
           cp -a libcxx/include/. "$headers/"
           config_site="$(find build/windows-module-sources -path '*/include/c++/v1/__config_site' -print -quit)"
           test -n "$config_site"
-          cp "$config_site" "$headers/__config_site"
+          cp -a "$(dirname "$config_site")/." "$headers/"
           cxx="$GITHUB_WORKSPACE/stage/toolchain/bin/clang++"
           common=( --target="$TARGET_TRIPLE" --sysroot="$sysroot" -resource-dir="$GITHUB_WORKSPACE/stage/toolchain/lib/clang/21" -std=c++26 -stdlib=libc++ -nostdinc++ -isystem "$headers" -Wno-reserved-module-identifier -Wno-reserved-user-defined-literal )
           "$cxx" "${common[@]}" --precompile -c "$modules/std.cppm" -o "$modules/std.pcm"
