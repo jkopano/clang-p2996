@@ -4040,6 +4040,7 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
               A->getValue())
               .Case("dwarf", LangOptions::ExceptionHandlingKind::DwarfCFI)
               .Case("sjlj", LangOptions::ExceptionHandlingKind::SjLj)
+              .Case("seh", LangOptions::ExceptionHandlingKind::WinEH)
               .Case("wineh", LangOptions::ExceptionHandlingKind::WinEH)
               .Case("wasm", LangOptions::ExceptionHandlingKind::Wasm)
               .Case("none", LangOptions::ExceptionHandlingKind::None)
