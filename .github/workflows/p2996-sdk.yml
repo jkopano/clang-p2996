@@ -149,10 +149,16 @@ jobs:
           root="$GITHUB_WORKSPACE/stage/windows-x64"
           sysroot="$root/sysroot"
           modules="$root/modules"
+          headers="$root/include/c++/v1"
           mkdir -p "$modules"
+          mkdir -p "$headers"
           cp -a build/windows-module-sources/modules/c++/v1/. "$modules/"
+          cp -a libcxx/include/. "$headers/"
+          config_site="$(find build/windows-module-sources -path '*/include/c++/v1/__config_site' -print -quit)"
+          test -n "$config_site"
+          cp "$config_site" "$headers/__config_site"
           cxx="$GITHUB_WORKSPACE/stage/toolchain/bin/clang++"
-          common=( --target="$TARGET_TRIPLE" --sysroot="$sysroot" -resource-dir="$GITHUB_WORKSPACE/stage/toolchain/lib/clang/21" -std=c++26 -stdlib=libc++ -nostdinc++ -isystem "$sysroot/include/c++/v1" -Wno-reserved-module-identifier -Wno-reserved-user-defined-literal )
+          common=( --target="$TARGET_TRIPLE" --sysroot="$sysroot" -resource-dir="$GITHUB_WORKSPACE/stage/toolchain/lib/clang/21" -std=c++26 -stdlib=libc++ -nostdinc++ -isystem "$headers" -Wno-reserved-module-identifier -Wno-reserved-user-defined-literal )
           "$cxx" "${common[@]}" --precompile -c "$modules/std.cppm" -o "$modules/std.pcm"
           "$cxx" "${common[@]}" -fmodule-file=std="$modules/std.pcm" --precompile -c "$modules/std.compat.cppm" -o "$modules/std.compat.pcm"
           printf 'import std; int main() { std::vector<int> v; return v.size(); }\n' > smoke.cpp
