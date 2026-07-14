@@ -58,7 +58,6 @@ jobs:
           -DLLVM_ENABLE_TERMINFO=OFF
           -DLLVM_ENABLE_ZLIB=FORCE_ON
           -DLLVM_ENABLE_ZSTD=FORCE_ON
-          -DLLVM_ENABLE_LTO=Thin
           -DLLVM_CCACHE_BUILD=ON
       - name: Build and install
         run: cmake --build build/toolchain --target install --parallel "$(nproc)"
